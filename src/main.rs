@@ -286,7 +286,7 @@ async fn run_app<B: Backend>(
         app.handle_messages();
 
         // Handle user input with immediate navigation response
-        if event::poll(Duration::from_millis(16)).map_err(|e| e.to_string())? { // ~60fps polling
+        if event::poll(Duration::from_millis(32)).map_err(|e| e.to_string())? { // ~30fps polling
             if let Event::Key(key) = event::read().map_err(|e| e.to_string())? {
                 match key.code {
                     KeyCode::Char('q') | KeyCode::Esc => return Ok(()),
