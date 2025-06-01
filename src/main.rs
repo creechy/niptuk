@@ -265,12 +265,12 @@ async fn run_app<B: Backend>(
                             });
                         }
                     },
-                    KeyCode::Char('d') => {
+                    KeyCode::Char('x') => {
                         if let Some(container) = app.containers.get(app.selected_index) {
                             if container.state != "running" {
                                 let container_id = container.id.clone();
                                 tokio::spawn(async move {
-                                    let _ = delete_container(&container_id).await;
+                                    let _ = remove_container(&container_id).await;
                                 });
                             }
                         }
@@ -297,7 +297,7 @@ fn ui(f: &mut Frame, app: &App) {
 
     // Main table
     let selected_style = Style::default().add_modifier(Modifier::REVERSED);
-    let header_cells = ["ID", "Name", "Status", "CPU %", "Memory", "Mem %", "Image"]
+    let header_cells = ["ID", "Name", "Status", "CPU %", "Memory (MB)", "Mem %", "Image"]
         .iter()
         .map(|h| Cell::from(*h).style(Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)));
     let header = Row::new(header_cells).height(1).bottom_margin(1);
@@ -374,7 +374,7 @@ fn ui(f: &mut Frame, app: &App) {
         std::time::SystemTime::now() - app.last_update.elapsed()
     );
     let help_text = format!(
-        "Last Update: {} | Auto-refresh: {} | q/ESC: Quit | ↑↓/jk: Navigate | r: Refresh | Space: Toggle auto-refresh | s: Start/Stop | d: Delete (stopped)",
+        "Last Update: {} | Auto-refresh: {} | q/ESC: Quit | ↑↓/jk: Navigate | r: Refresh | Space: Toggle auto-refresh | s: Start/Stop | x: Remove (stopped)",
         last_update_time.format("%H:%M:%S"),
         if app.auto_refresh {
             "ON "
@@ -567,7 +567,7 @@ async fn get_container_resource_stats(
             let percent = if limit > 0 { (usage as f64 / limit as f64) * 100.0 } else { 0.0 };
             
             if usage > 0 && limit > 0 {
-                (format!("{:.1}MB / {:.1}MB", usage_mb, limit_mb), percent)
+                (format!("{:.1} / {:.1}", usage_mb, limit_mb), percent)
             } else {
                 ("N/A".to_string(), 0.0)
             }
@@ -591,7 +591,7 @@ async fn stop_container(container_id: &str) -> Result<(), String> {
     Ok(())
 }
 
-async fn delete_container(container_id: &str) -> Result<(), String> {
+async fn remove_container(container_id: &str) -> Result<(), String> {
     let docker = Docker::connect_with_socket_defaults().map_err(|e| e.to_string())?;
     let options = Some(RemoveContainerOptions {
         force: false,
