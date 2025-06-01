@@ -327,25 +327,25 @@ fn ui(f: &mut Frame, app: &App) {
 
         Row::new(vec![
             Cell::from(container.id.chars().take(12).collect::<String>()),
-            Cell::from(container.name.chars().take(30).collect::<String>()),
-            Cell::from(container.status.chars().take(15).collect::<String>()).style(Style::default().fg(status_color)),
+            Cell::from(container.name.clone()),
+            Cell::from(container.status.clone()).style(Style::default().fg(status_color)),
             Cell::from(format!("{:.1}%", container.cpu_percent)).style(Style::default().fg(cpu_color)),
             Cell::from(container.memory_usage.clone()),
             Cell::from(format!("{:.1}%", container.memory_percent)).style(Style::default().fg(mem_color)),
-            Cell::from(container.image.chars().take(20).collect::<String>()),
+            Cell::from(container.image.clone()),
         ])
     });
 
     let table = Table::new(
         rows,
         [
-            Constraint::Length(12),
-            Constraint::Length(30),
-            Constraint::Length(15),
-            Constraint::Length(8),
-            Constraint::Length(25),
-            Constraint::Length(8),
-            Constraint::Length(20),
+            Constraint::Length(12),     // ID - fixed width
+            Constraint::Fill(1),        // Name - flexible, equal share
+            Constraint::Fill(1),        // Status - flexible, equal share  
+            Constraint::Length(8),      // CPU % - fixed width
+            Constraint::Length(25),     // Memory - fixed width
+            Constraint::Length(8),      // Mem % - fixed width
+            Constraint::Fill(1),        // Image - flexible, equal share
         ]
     )
         .header(header)
