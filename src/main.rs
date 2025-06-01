@@ -28,7 +28,18 @@ use std::{
     collections::HashMap,
     io,
     time::{Duration, Instant},
+    sync::{Arc, Mutex},
 };
+
+#[derive(Debug, Clone)]
+struct PreviousStats {
+    cpu_total: u64,
+    system_cpu: u64,
+    timestamp: Instant,
+}
+
+static PREVIOUS_STATS: std::sync::LazyLock<Arc<Mutex<HashMap<String, PreviousStats>>>> = 
+    std::sync::LazyLock::new(|| Arc::new(Mutex::new(HashMap::new())));
 
 #[derive(Debug, Clone)]
 struct ContainerInfo {
@@ -358,10 +369,13 @@ fn ui(f: &mut Frame, app: &App) {
         f.render_widget(info_paragraph, chunks[1]);
     }
 
-    // Status/Help bar
+    // Status/Help bar - use actual last update time from app state
+    let last_update_time = chrono::DateTime::<chrono::Utc>::from(
+        std::time::SystemTime::now() - app.last_update.elapsed()
+    );
     let help_text = format!(
         "Last Update: {} | {}",
-        chrono::Utc::now().format("%H:%M:%S"),
+        last_update_time.format("%H:%M:%S"),
         if app.auto_refresh {
             "Auto-refresh: ON | q/ESC: Quit | ↑↓/jk: Navigate | r: Refresh | Space: Toggle auto-refresh | s: Start/Stop | d: Delete (stopped containers)"
         } else {
@@ -507,25 +521,39 @@ async fn get_container_resource_stats(
     if let Some(stats_result) = stats_stream.next().await {
         let stats = stats_result.map_err(|e| e.to_string())?;
         
-        // Calculate CPU percentage - Fixed to handle direct CPUStats structs
-        let cpu_percent = if let (Some(system_usage), Some(pre_system_usage)) = (
-            stats.cpu_stats.system_cpu_usage,
-            stats.precpu_stats.system_cpu_usage,
-        ) {
-            let cpu_usage = &stats.cpu_stats.cpu_usage;
-            let precpu_usage = &stats.precpu_stats.cpu_usage;
+        // Calculate CPU percentage using cached previous values
+        let cpu_percent = {
+            let current_cpu_total = stats.cpu_stats.cpu_usage.total_usage;
+            let current_system_cpu = stats.cpu_stats.system_cpu_usage.unwrap_or(0);
+            let current_time = Instant::now();
+            let number_cpus = stats.cpu_stats.online_cpus.unwrap_or_else(|| {
+                stats.cpu_stats.cpu_usage.percpu_usage.as_ref().map(|v| v.len() as u64).unwrap_or(1)
+            }) as f64;
             
-            let cpu_delta = cpu_usage.total_usage.saturating_sub(precpu_usage.total_usage);
-            let system_delta = system_usage.saturating_sub(pre_system_usage);
-            let number_cpus = cpu_usage.percpu_usage.as_ref().map(|v| v.len()).unwrap_or(1) as f64;
+            let mut previous_stats_map = PREVIOUS_STATS.lock().unwrap();
             
-            if system_delta > 0 {
-                (cpu_delta as f64 / system_delta as f64) * number_cpus * 100.0
+            let cpu_percent = if let Some(prev) = previous_stats_map.get(container_id) {
+                let cpu_delta = current_cpu_total.saturating_sub(prev.cpu_total) as f64;
+                let system_delta = current_system_cpu.saturating_sub(prev.system_cpu) as f64;
+                let time_delta = current_time.duration_since(prev.timestamp).as_secs_f64();
+                
+                if system_delta > 0.0 && time_delta > 0.0 {
+                    (cpu_delta / system_delta) * number_cpus * 100.0
+                } else {
+                    0.0
+                }
             } else {
-                0.0
-            }
-        } else {
-            0.0
+                0.0 // First measurement, no previous data
+            };
+            
+            // Update the cache with current values
+            previous_stats_map.insert(container_id.to_string(), PreviousStats {
+                cpu_total: current_cpu_total,
+                system_cpu: current_system_cpu,
+                timestamp: current_time,
+            });
+            
+            cpu_percent
         };
         
         // Calculate memory usage and percentage - Fixed to handle direct MemoryStats struct
