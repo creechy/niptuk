@@ -432,7 +432,7 @@ fn ui(f: &mut Frame, app: &App) {
         std::time::SystemTime::now() - app.last_update.elapsed()
     );
     let help_text = format!(
-        "Last Update: {} | Auto-refresh: {} | q/ESC: Quit | ↑↓/jk: Navigate | r: Refresh | Space: Toggle auto-refresh | s: Start/Stop | x: Remove (stopped)",
+        "Last Update: {} | Auto-refresh: {} || q/ESC: Quit | ↑↓/jk: Navigate | r: Refresh | Space: Toggle auto-refresh | s: Start/Stop | x: Remove stopped",
         last_update_time.format("%H:%M:%S"),
         if app.auto_refresh {
             "ON "
