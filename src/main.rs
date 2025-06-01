@@ -61,6 +61,13 @@ enum AppMessage {
     Shutdown,
 }
 
+#[derive(Debug)]
+enum BackgroundCommand {
+    SetAutoRefresh(bool),
+    ForceRefresh,
+    Shutdown,
+}
+
 struct App {
     containers: Vec<ContainerInfo>,
     selected_index: usize,
@@ -68,18 +75,20 @@ struct App {
     error_message: Option<String>,
     auto_refresh: bool,
     receiver: mpsc::UnboundedReceiver<AppMessage>,
+    background_sender: mpsc::UnboundedSender<BackgroundCommand>,
     shutdown_sender: tokio::sync::oneshot::Sender<()>,
 }
 
 impl App {
     async fn new() -> Result<App, String> {
         let (tx, rx) = mpsc::unbounded_channel();
+        let (bg_tx, bg_rx) = mpsc::unbounded_channel();
         let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
         
         // Spawn background task for stats collection
         let stats_tx = tx.clone();
         tokio::spawn(async move {
-            stats_collection_task(stats_tx, shutdown_rx).await;
+            stats_collection_task(stats_tx, bg_rx, shutdown_rx).await;
         });
 
         Ok(App {
@@ -89,6 +98,7 @@ impl App {
             error_message: None,
             auto_refresh: true,
             receiver: rx,
+            background_sender: bg_tx,
             shutdown_sender: shutdown_tx,
         })
     }
@@ -111,6 +121,13 @@ impl App {
 
     fn toggle_auto_refresh(&mut self) {
         self.auto_refresh = !self.auto_refresh;
+        // Send command to background task
+        let _ = self.background_sender.send(BackgroundCommand::SetAutoRefresh(self.auto_refresh));
+    }
+
+    fn force_refresh(&mut self) {
+        // Send force refresh command to background task
+        let _ = self.background_sender.send(BackgroundCommand::ForceRefresh);
     }
 
     fn handle_messages(&mut self) {
@@ -140,16 +157,31 @@ impl App {
     }
 
     fn shutdown(self) {
+        let _ = self.background_sender.send(BackgroundCommand::Shutdown);
         let _ = self.shutdown_sender.send(());
     }
 }
 
 async fn stats_collection_task(
-    sender: mpsc::UnboundedSender<AppMessage>, 
+    sender: mpsc::UnboundedSender<AppMessage>,
+    mut command_receiver: mpsc::UnboundedReceiver<BackgroundCommand>,
     mut shutdown_receiver: tokio::sync::oneshot::Receiver<()>
 ) {
-    let mut last_refresh = Instant::now();
+    let mut last_refresh: Instant;
     let mut interval = tokio::time::interval(Duration::from_millis(100));
+    let mut auto_refresh = true; // Start with auto-refresh enabled
+    
+    // Get initial data
+    match get_container_stats().await {
+        Ok(containers) => {
+            let _ = sender.send(AppMessage::ContainerData(containers));
+        }
+        Err(e) => {
+            let _ = sender.send(AppMessage::Error(format!("Error: {}", e)));
+        }
+    }
+
+    last_refresh = Instant::now();
     
     loop {
         tokio::select! {
@@ -157,19 +189,44 @@ async fn stats_collection_task(
                 let _ = sender.send(AppMessage::Shutdown);
                 break;
             }
+            command = command_receiver.recv() => {
+                match command {
+                    Some(BackgroundCommand::SetAutoRefresh(enabled)) => {
+                        auto_refresh = enabled;
+                    }
+                    Some(BackgroundCommand::ForceRefresh) => {
+                        // Force immediate refresh regardless of auto_refresh setting
+                        match get_container_stats().await {
+                            Ok(containers) => {
+                                if sender.send(AppMessage::ContainerData(containers)).is_err() {
+                                    break;
+                                }
+                            }
+                            Err(e) => {
+                                if sender.send(AppMessage::Error(format!("Error: {}", e))).is_err() {
+                                    break;
+                                }
+                            }
+                        }
+                        last_refresh = Instant::now();
+                    }
+                    Some(BackgroundCommand::Shutdown) | None => {
+                        let _ = sender.send(AppMessage::Shutdown);
+                        break;
+                    }
+                }
+            }
             _ = interval.tick() => {
-                // Refresh data every second
-                if last_refresh.elapsed() >= Duration::from_secs(1) {
+                // Only refresh automatically if auto_refresh is enabled
+                if auto_refresh && last_refresh.elapsed() >= Duration::from_secs(1) {
                     match get_container_stats().await {
                         Ok(containers) => {
                             if sender.send(AppMessage::ContainerData(containers)).is_err() {
-                                // Main thread has disconnected, exit
                                 break;
                             }
                         }
                         Err(e) => {
                             if sender.send(AppMessage::Error(format!("Error: {}", e))).is_err() {
-                                // Main thread has disconnected, exit
                                 break;
                             }
                         }
@@ -246,8 +303,8 @@ async fn run_app<B: Backend>(
                         continue;
                     },
                     KeyCode::Char('r') => {
-                        // Manual refresh - the background task will pick this up automatically
-                        // We could add a force refresh mechanism if needed
+                        // Manual refresh - force refresh regardless of auto-refresh setting
+                        app.force_refresh();
                     },
                     KeyCode::Char(' ') => {
                         app.toggle_auto_refresh();
@@ -340,12 +397,12 @@ fn ui(f: &mut Frame, app: &App) {
         rows,
         [
             Constraint::Length(12),     // ID - fixed width
-            Constraint::Fill(1),        // Name - flexible, equal share
-            Constraint::Fill(1),        // Status - flexible, equal share  
+            Constraint::Fill(3),        // Name - flexible, equal share
+            Constraint::Fill(2),        // Status - flexible, equal share  
             Constraint::Length(8),      // CPU % - fixed width
-            Constraint::Length(25),     // Memory - fixed width
+            Constraint::Length(20),     // Memory - fixed width
             Constraint::Length(8),      // Mem % - fixed width
-            Constraint::Fill(1),        // Image - flexible, equal share
+            Constraint::Fill(2),        // Image - flexible, equal share
         ]
     )
         .header(header)
