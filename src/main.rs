@@ -11,13 +11,22 @@ use ratatui::{
     widgets::{Block, Borders, Cell, Paragraph, Row, Table, TableState},
     Frame, Terminal,
 };
-use serde_json::Value;
+use bollard::{
+    Docker,
+    container::{
+        ListContainersOptions, 
+        StartContainerOptions, 
+        StopContainerOptions, 
+        RemoveContainerOptions,
+        StatsOptions
+    },
+    models::ContainerSummary,
+};
+use futures::stream::StreamExt;
+use tokio::sync::mpsc;
 use std::{
-    error::Error,
+    collections::HashMap,
     io,
-    process::Command,
-    sync::mpsc,
-    thread,
     time::{Duration, Instant},
 };
 
@@ -31,6 +40,7 @@ struct ContainerInfo {
     memory_percent: f64,
     image: String,
     ports: String,
+    state: String,
 }
 
 #[derive(Debug)]
@@ -46,19 +56,19 @@ struct App {
     last_update: Instant,
     error_message: Option<String>,
     auto_refresh: bool,
-    receiver: mpsc::Receiver<AppMessage>,
-    shutdown_sender: mpsc::Sender<()>,
+    receiver: mpsc::UnboundedReceiver<AppMessage>,
+    shutdown_sender: tokio::sync::oneshot::Sender<()>,
 }
 
 impl App {
-    fn new() -> Result<App, Box<dyn Error>> {
-        let (tx, rx) = mpsc::channel();
-        let (shutdown_tx, shutdown_rx) = mpsc::channel();
+    async fn new() -> Result<App, String> {
+        let (tx, rx) = mpsc::unbounded_channel();
+        let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
         
-        // Spawn background thread for stats collection
+        // Spawn background task for stats collection
         let stats_tx = tx.clone();
-        thread::spawn(move || {
-            stats_collection_thread(stats_tx, shutdown_rx);
+        tokio::spawn(async move {
+            stats_collection_task(stats_tx, shutdown_rx).await;
         });
 
         Ok(App {
@@ -111,117 +121,121 @@ impl App {
                     self.last_update = Instant::now();
                 }
                 AppMessage::Shutdown => {
-                    // Background thread is shutting down
+                    // Background task is shutting down
                     break;
                 }
             }
         }
     }
 
-    fn shutdown(&self) {
+    fn shutdown(self) {
         let _ = self.shutdown_sender.send(());
     }
 }
 
-fn stats_collection_thread(sender: mpsc::Sender<AppMessage>, shutdown_receiver: mpsc::Receiver<()>) {
+async fn stats_collection_task(
+    sender: mpsc::UnboundedSender<AppMessage>, 
+    mut shutdown_receiver: tokio::sync::oneshot::Receiver<()>
+) {
     let mut last_refresh = Instant::now();
+    let mut interval = tokio::time::interval(Duration::from_millis(100));
     
     loop {
-        // Check for shutdown signal (non-blocking)
-        if shutdown_receiver.try_recv().is_ok() {
-            let _ = sender.send(AppMessage::Shutdown);
-            break;
-        }
-
-        // Refresh data every second
-        if last_refresh.elapsed() >= Duration::from_secs(1) {
-            match get_container_stats() {
-                Ok(containers) => {
-                    if sender.send(AppMessage::ContainerData(containers)).is_err() {
-                        // Main thread has disconnected, exit
-                        break;
+        tokio::select! {
+            _ = &mut shutdown_receiver => {
+                let _ = sender.send(AppMessage::Shutdown);
+                break;
+            }
+            _ = interval.tick() => {
+                // Refresh data every second
+                if last_refresh.elapsed() >= Duration::from_secs(1) {
+                    match get_container_stats().await {
+                        Ok(containers) => {
+                            if sender.send(AppMessage::ContainerData(containers)).is_err() {
+                                // Main thread has disconnected, exit
+                                break;
+                            }
+                        }
+                        Err(e) => {
+                            if sender.send(AppMessage::Error(format!("Error: {}", e))).is_err() {
+                                // Main thread has disconnected, exit
+                                break;
+                            }
+                        }
                     }
-                }
-                Err(e) => {
-                    if sender.send(AppMessage::Error(format!("Error: {}", e))).is_err() {
-                        // Main thread has disconnected, exit
-                        break;
-                    }
+                    last_refresh = Instant::now();
                 }
             }
-            last_refresh = Instant::now();
         }
-
-        // Short sleep to prevent busy waiting
-        thread::sleep(Duration::from_millis(100));
     }
 }
 
-fn main() -> Result<(), Box<dyn Error>> {
+#[tokio::main]
+async fn main() -> Result<(), String> {
     // Check if Docker is available
-    if !is_docker_available() {
+    if !is_docker_available().await {
         eprintln!("Error: Docker is not available or not running");
         return Ok(());
     }
 
     // Setup terminal
-    enable_raw_mode()?;
+    enable_raw_mode().map_err(|e| e.to_string())?;
     let mut stdout = io::stdout();
-    execute!(stdout, EnterAlternateScreen, EnableMouseCapture)?;
+    execute!(stdout, EnterAlternateScreen, EnableMouseCapture).map_err(|e| e.to_string())?;
     let backend = CrosstermBackend::new(stdout);
-    let mut terminal = Terminal::new(backend)?;
+    let mut terminal = Terminal::new(backend).map_err(|e| e.to_string())?;
 
     // Create app and run
-    let mut app = App::new()?;
-    let res = run_app(&mut terminal, &mut app);
+    let mut app = App::new().await?;
+    let res = run_app(&mut terminal, &mut app).await;
 
-    // Shutdown background thread
+    // Shutdown background task
     app.shutdown();
 
     // Restore terminal
-    disable_raw_mode()?;
+    disable_raw_mode().map_err(|e| e.to_string())?;
     execute!(
         terminal.backend_mut(),
         LeaveAlternateScreen,
         DisableMouseCapture
-    )?;
-    terminal.show_cursor()?;
+    ).map_err(|e| e.to_string())?;
+    terminal.show_cursor().map_err(|e| e.to_string())?;
 
     if let Err(err) = res {
-        println!("{:?}", err);
+        println!("{}", err);
     }
 
     Ok(())
 }
 
-fn run_app<B: Backend>(
+async fn run_app<B: Backend>(
     terminal: &mut Terminal<B>,
     app: &mut App,
-) -> Result<(), Box<dyn Error>> {
+) -> Result<(), String> {
     
     loop {
-        // Handle messages from background thread
+        // Handle messages from background task
         app.handle_messages();
 
         // Handle user input with immediate navigation response
-        if event::poll(Duration::from_millis(16))? { // ~60fps polling
-            if let Event::Key(key) = event::read()? {
+        if event::poll(Duration::from_millis(16)).map_err(|e| e.to_string())? { // ~60fps polling
+            if let Event::Key(key) = event::read().map_err(|e| e.to_string())? {
                 match key.code {
                     KeyCode::Char('q') | KeyCode::Esc => return Ok(()),
                     KeyCode::Down | KeyCode::Char('j') => {
                         app.next();
                         // Immediate redraw for navigation - no data refresh needed
-                        terminal.draw(|f| ui(f, app))?;
+                        terminal.draw(|f| ui(f, app)).map_err(|e| e.to_string())?;
                         continue;
                     },
                     KeyCode::Up | KeyCode::Char('k') => {
                         app.previous();
                         // Immediate redraw for navigation - no data refresh needed
-                        terminal.draw(|f| ui(f, app))?;
+                        terminal.draw(|f| ui(f, app)).map_err(|e| e.to_string())?;
                         continue;
                     },
                     KeyCode::Char('r') => {
-                        // Manual refresh - the background thread will pick this up automatically
+                        // Manual refresh - the background task will pick this up automatically
                         // We could add a force refresh mechanism if needed
                     },
                     KeyCode::Char(' ') => {
@@ -229,19 +243,24 @@ fn run_app<B: Backend>(
                     },
                     KeyCode::Char('s') => {
                         if let Some(container) = app.containers.get(app.selected_index) {
-                            if container.status.starts_with("Up") {
-                                let _ = stop_container(&container.id);
-                            } else {
-                                let _ = start_container(&container.id);
-                            }
-                            // The background thread will refresh data automatically
+                            let container_id = container.id.clone();
+                            let container_state = container.state.clone();
+                            tokio::spawn(async move {
+                                if container_state == "running" {
+                                    let _ = stop_container(&container_id).await;
+                                } else {
+                                    let _ = start_container(&container_id).await;
+                                }
+                            });
                         }
                     },
                     KeyCode::Char('d') => {
                         if let Some(container) = app.containers.get(app.selected_index) {
-                            if !container.status.starts_with("Up") {
-                                let _ = delete_container(&container.id);
-                                // The background thread will refresh data automatically
+                            if container.state != "running" {
+                                let container_id = container.id.clone();
+                                tokio::spawn(async move {
+                                    let _ = delete_container(&container_id).await;
+                                });
                             }
                         }
                     }
@@ -250,8 +269,8 @@ fn run_app<B: Backend>(
             }
         }
 
-        // Regular redraw (data updates come from background thread)
-        terminal.draw(|f| ui(f, app))?;
+        // Regular redraw (data updates come from background task)
+        terminal.draw(|f| ui(f, app)).map_err(|e| e.to_string())?;
     }
 }
 
@@ -289,7 +308,7 @@ fn ui(f: &mut Frame, app: &App) {
             Color::Green
         };
 
-        let status_color = if container.status.starts_with("Up") {
+        let status_color = if container.state == "running" {
             Color::Green
         } else {
             Color::Red
@@ -365,47 +384,56 @@ fn ui(f: &mut Frame, app: &App) {
     }
 }
 
-fn is_docker_available() -> bool {
-    Command::new("docker")
-        .arg("version")
-        .output()
-        .map(|output| output.status.success())
-        .unwrap_or(false)
+async fn is_docker_available() -> bool {
+    match Docker::connect_with_socket_defaults() {
+        Ok(docker) => {
+            docker.version().await.is_ok()
+        }
+        Err(_) => false,
+    }
 }
 
-fn get_container_stats() -> Result<Vec<ContainerInfo>, Box<dyn std::error::Error>> {
-    let containers_output = Command::new("docker")
-        .args(&["ps", "-a", "--format", "{{.ID}}\t{{.Names}}\t{{.Status}}\t{{.Image}}\t{{.Ports}}"])
-        .output()?;
-
-    if !containers_output.status.success() {
-        return Err("Failed to get container list".into());
-    }
-
-    let containers_list = String::from_utf8(containers_output.stdout)?;
-    let mut containers = Vec::new();
-
-    for line in containers_list.lines() {
-        if line.trim().is_empty() {
-            continue;
+async fn get_container_stats() -> Result<Vec<ContainerInfo>, String> {
+    let docker = Docker::connect_with_socket_defaults().map_err(|e| e.to_string())?;
+    
+    // Get all containers (running and stopped)
+    let options = Some(ListContainersOptions::<String> {
+        all: true,
+        ..Default::default()
+    });
+    
+    let containers = docker.list_containers(options).await.map_err(|e| e.to_string())?;
+    let mut container_infos = Vec::new();
+    
+    // Collect stats for running containers
+    let mut stats_map = HashMap::new();
+    for container in &containers {
+        if let Some(id) = &container.id {
+            let state = get_container_state(container);
+            if state == "running" {
+                if let Ok((cpu, mem_usage, mem_percent)) = get_container_resource_stats(&docker, id).await {
+                    stats_map.insert(id.clone(), (cpu, mem_usage, mem_percent));
+                }
+            }
         }
+    }
+    
+    // Build container info list
+    for container in containers {
+        if let Some(ref id) = container.id {
+            let name = extract_container_name(&container);
+            let status = container.status.clone().unwrap_or_else(|| "Unknown".to_string());
+            let image = container.image.clone().unwrap_or_else(|| "Unknown".to_string());
+            let ports = format_ports(&container);
+            let state = get_container_state(&container);
+            
+            let (cpu_percent, memory_usage, memory_percent) = stats_map
+                .get(id)
+                .cloned()
+                .unwrap_or((0.0, "N/A".to_string(), 0.0));
 
-        let parts: Vec<&str> = line.split('\t').collect();
-        if parts.len() >= 4 {
-            let container_id = parts[0].to_string();
-            let name = parts[1].to_string();
-            let status = parts[2].to_string();
-            let image = parts[3].to_string();
-            let ports = parts.get(4).unwrap_or(&"").to_string();
-
-            let (cpu_percent, memory_usage, memory_percent) = if status.starts_with("Up") {
-                get_container_resource_stats(&container_id).unwrap_or((0.0, "N/A".to_string(), 0.0))
-            } else {
-                (0.0, "N/A".to_string(), 0.0)
-            };
-
-            containers.push(ContainerInfo {
-                id: container_id,
+            container_infos.push(ContainerInfo {
+                id: id.clone(),
                 name,
                 status,
                 cpu_percent,
@@ -413,93 +441,135 @@ fn get_container_stats() -> Result<Vec<ContainerInfo>, Box<dyn std::error::Error
                 memory_percent,
                 image,
                 ports,
+                state,
             });
         }
     }
 
-    Ok(containers)
+    Ok(container_infos)
 }
 
-fn get_container_resource_stats(container_id: &str) -> Result<(f64, String, f64), Box<dyn std::error::Error>> {
-    let stats_output = Command::new("docker")
-        .args(&["stats", "--no-stream", "--format", "json", container_id])
-        .output()?;
-
-    if !stats_output.status.success() {
-        return Ok((0.0, "N/A".to_string(), 0.0));
-    }
-
-    let stats_json = String::from_utf8(stats_output.stdout)?;
-    let stats: Value = serde_json::from_str(&stats_json)?;
-
-    let cpu_percent = stats["CPUPerc"]
-        .as_str()
-        .unwrap_or("0%")
-        .trim_end_matches('%')
-        .parse::<f64>()
-        .unwrap_or(0.0);
-
-    let memory_usage = stats["MemUsage"]
-        .as_str()
-        .unwrap_or("N/A")
-        .to_string();
-
-    let memory_percent = stats["MemPerc"]
-        .as_str()
-        .unwrap_or("0%")
-        .trim_end_matches('%')
-        .parse::<f64>()
-        .unwrap_or(0.0);
-
-    Ok((cpu_percent, memory_usage, memory_percent))
+fn get_container_state(container: &ContainerSummary) -> String {
+    container.state.as_deref().unwrap_or("unknown").to_string()
 }
 
-fn start_container(container_id: &str) -> Result<(), Box<dyn std::error::Error>> {
-    let output = Command::new("docker")
-        .args(&["start", container_id])
-        .output()?;
-        
-    if !output.status.success() {
-        return Err("Failed to start container".into());
-    }
+fn extract_container_name(container: &ContainerSummary) -> String {
+    container.names
+        .as_ref()
+        .and_then(|names| names.first())
+        .map(|name| name.trim_start_matches('/').to_string())
+        .unwrap_or_else(|| "Unknown".to_string())
+}
+
+fn format_ports(container: &ContainerSummary) -> String {
+    container.ports
+        .as_ref()
+        .map(|ports| {
+            ports.iter()
+                .filter_map(|port| {
+                    // private_port is u16, public_port is Option<u16>, typ is Option<PortTypeEnum>
+                    let private_port = port.private_port;
+                    let public_port = port.public_port;
+                    let port_type = &port.typ;
+                    
+                    if let Some(port_type_enum) = port_type {
+                        Some(format!("{}:{}->{}/{}", 
+                            public_port.map_or("".to_string(), |p| p.to_string()),
+                            private_port,
+                            private_port,
+                            port_type_enum.to_string()
+                        ))
+                    } else {
+                        Some(format!("{}:{}->{}/tcp", 
+                            public_port.map_or("".to_string(), |p| p.to_string()),
+                            private_port,
+                            private_port
+                        ))
+                    }
+                })
+                .collect::<Vec<_>>()
+                .join(", ")
+        })
+        .unwrap_or_else(|| "".to_string())
+}
+
+async fn get_container_resource_stats(
+    docker: &Docker, 
+    container_id: &str
+) -> Result<(f64, String, f64), String> {
+    let options = Some(StatsOptions {
+        stream: false,
+        one_shot: true,
+    });
     
+    let mut stats_stream = docker.stats(container_id, options);
+    
+    if let Some(stats_result) = stats_stream.next().await {
+        let stats = stats_result.map_err(|e| e.to_string())?;
+        
+        // Calculate CPU percentage - Fixed to handle direct CPUStats structs
+        let cpu_percent = if let (Some(system_usage), Some(pre_system_usage)) = (
+            stats.cpu_stats.system_cpu_usage,
+            stats.precpu_stats.system_cpu_usage,
+        ) {
+            let cpu_usage = &stats.cpu_stats.cpu_usage;
+            let precpu_usage = &stats.precpu_stats.cpu_usage;
+            
+            let cpu_delta = cpu_usage.total_usage.saturating_sub(precpu_usage.total_usage);
+            let system_delta = system_usage.saturating_sub(pre_system_usage);
+            let number_cpus = cpu_usage.percpu_usage.as_ref().map(|v| v.len()).unwrap_or(1) as f64;
+            
+            if system_delta > 0 {
+                (cpu_delta as f64 / system_delta as f64) * number_cpus * 100.0
+            } else {
+                0.0
+            }
+        } else {
+            0.0
+        };
+        
+        // Calculate memory usage and percentage - Fixed to handle direct MemoryStats struct
+        let (memory_usage_str, memory_percent) = {
+            let memory_stats = &stats.memory_stats;
+            let usage = memory_stats.usage.unwrap_or(0);
+            let limit = memory_stats.limit.unwrap_or(1);
+            
+            let usage_mb = usage as f64 / 1024.0 / 1024.0;
+            let limit_mb = limit as f64 / 1024.0 / 1024.0;
+            let percent = if limit > 0 { (usage as f64 / limit as f64) * 100.0 } else { 0.0 };
+            
+            if usage > 0 && limit > 0 {
+                (format!("{:.1}MB / {:.1}MB", usage_mb, limit_mb), percent)
+            } else {
+                ("N/A".to_string(), 0.0)
+            }
+        };
+        
+        Ok((cpu_percent, memory_usage_str, memory_percent))
+    } else {
+        Ok((0.0, "N/A".to_string(), 0.0))
+    }
+}
+
+async fn start_container(container_id: &str) -> Result<(), String> {
+    let docker = Docker::connect_with_socket_defaults().map_err(|e| e.to_string())?;
+    docker.start_container(container_id, None::<StartContainerOptions<String>>).await.map_err(|e| e.to_string())?;
     Ok(())
 }
 
-fn stop_container(container_id: &str) -> Result<(), Box<dyn std::error::Error>> {
-    let output = Command::new("docker")
-        .args(&["stop", container_id])
-        .output()?;
-        
-    if !output.status.success() {
-        return Err("Failed to stop container".into());
-    }
-    
+async fn stop_container(container_id: &str) -> Result<(), String> {
+    let docker = Docker::connect_with_socket_defaults().map_err(|e| e.to_string())?;
+    docker.stop_container(container_id, None::<StopContainerOptions>).await.map_err(|e| e.to_string())?;
     Ok(())
 }
 
-fn delete_container(container_id: &str) -> Result<(), Box<dyn std::error::Error>> {
-    let output = Command::new("docker")
-        .args(&["rm", container_id])
-        .output()?;
-        
-    if !output.status.success() {
-        return Err("Failed to delete container".into());
-    }
-    
+async fn delete_container(container_id: &str) -> Result<(), String> {
+    let docker = Docker::connect_with_socket_defaults().map_err(|e| e.to_string())?;
+    let options = Some(RemoveContainerOptions {
+        force: false,
+        v: true,
+        link: false,
+    });
+    docker.remove_container(container_id, options).await.map_err(|e| e.to_string())?;
     Ok(())
 }
-
-// Add these dependencies to your Cargo.toml:
-/*
-[package]
-name = "docker-monitor-tui"
-version = "0.1.0"
-edition = "2021"
-
-[dependencies]
-ratatui = "0.26"
-crossterm = "0.27"
-serde_json = "1.0"
-chrono = { version = "0.4", features = ["serde"] }
-*/
