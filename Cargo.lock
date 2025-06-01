@@ -238,18 +238,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "dosee"
-version = "0.1.0"
-dependencies = [
- "bollard",
- "chrono",
- "crossterm",
- "futures",
- "ratatui",
- "tokio",
-]
-
-[[package]]
 name = "either"
 version = "1.15.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -776,6 +764,18 @@ dependencies = [
  "libc",
  "wasi",
  "windows-sys 0.59.0",
+]
+
+[[package]]
+name = "niptuk"
+version = "0.1.0"
+dependencies = [
+ "bollard",
+ "chrono",
+ "crossterm",
+ "futures",
+ "ratatui",
+ "tokio",
 ]
 
 [[package]]
