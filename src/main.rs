@@ -347,7 +347,7 @@ fn ui(f: &mut Frame, app: &App) {
         .direction(Direction::Vertical)
         .constraints([
             Constraint::Min(10),    // Main table
-            Constraint::Length(5),  // Details
+            Constraint::Length(6),  // Details panel
             Constraint::Length(3),  // Status/Help
         ])
         .split(f.size());
@@ -418,6 +418,7 @@ fn ui(f: &mut Frame, app: &App) {
     if let Some(container) = app.containers.get(app.selected_index) {
         let info_text = vec![
             Line::from(vec![Span::styled("Full ID: ", Style::default().fg(Color::Yellow)), Span::raw(&container.id)]),
+            Line::from(vec![Span::styled("Full Image: ", Style::default().fg(Color::Yellow)), Span::raw(&container.image)]),
             Line::from(vec![Span::styled("Ports: ", Style::default().fg(Color::Yellow)), Span::raw(&container.ports)]),
         ];
 
