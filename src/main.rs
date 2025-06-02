@@ -23,7 +23,7 @@ use bollard::{
     models::ContainerSummary,
 };
 use futures::stream::StreamExt;
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, Semaphore};
 use std::{
     collections::HashMap,
     io,
@@ -68,6 +68,83 @@ enum BackgroundCommand {
     Shutdown,
 }
 
+// Docker Connection Pool
+#[derive(Clone)]
+struct DockerPool {
+    connections: Arc<Vec<Docker>>,
+    semaphore: Arc<Semaphore>,
+    current_index: Arc<Mutex<usize>>,
+}
+
+impl DockerPool {
+    async fn new(pool_size: usize) -> Result<Self, String> {
+        let mut connections = Vec::with_capacity(pool_size);
+        
+        // Create multiple Docker connections
+        for _ in 0..pool_size {
+            let docker = Docker::connect_with_socket_defaults()
+                .map_err(|e| format!("Failed to create Docker connection: {}", e))?;
+            connections.push(docker);
+        }
+        
+        Ok(DockerPool {
+            connections: Arc::new(connections),
+            semaphore: Arc::new(Semaphore::new(pool_size)),
+            current_index: Arc::new(Mutex::new(0)),
+        })
+    }
+    
+    // Get a connection from the pool (round-robin selection)
+    async fn get_connection(&self) -> Result<DockerConnection, String> {
+        // Acquire a permit from the semaphore to limit concurrent usage
+        let permit = self.semaphore.clone()
+            .acquire_owned()
+            .await
+            .map_err(|e| format!("Failed to acquire connection permit: {}", e))?;
+        
+        // Get the next connection using round-robin
+        let index = {
+            let mut current = self.current_index.lock().unwrap();
+            let index = *current;
+            *current = (*current + 1) % self.connections.len();
+            index
+        };
+        
+        let docker = self.connections[index].clone();
+        
+        Ok(DockerConnection {
+            docker,
+            _permit: permit,
+        })
+    }
+    
+    // Get a connection for simple operations (no permit required)
+    fn get_simple_connection(&self) -> Docker {
+        let index = {
+            let mut current = self.current_index.lock().unwrap();
+            let index = *current;
+            *current = (*current + 1) % self.connections.len();
+            index
+        };
+        
+        self.connections[index].clone()
+    }
+}
+
+// Wrapper that holds a connection and its semaphore permit
+struct DockerConnection {
+    docker: Docker,
+    _permit: tokio::sync::OwnedSemaphorePermit,
+}
+
+impl std::ops::Deref for DockerConnection {
+    type Target = Docker;
+    
+    fn deref(&self) -> &Self::Target {
+        &self.docker
+    }
+}
+
 struct App {
     containers: Vec<ContainerInfo>,
     selected_index: usize,
@@ -77,6 +154,7 @@ struct App {
     receiver: mpsc::UnboundedReceiver<AppMessage>,
     background_sender: mpsc::UnboundedSender<BackgroundCommand>,
     shutdown_sender: tokio::sync::oneshot::Sender<()>,
+    docker_pool: DockerPool,
 }
 
 impl App {
@@ -85,10 +163,18 @@ impl App {
         let (bg_tx, bg_rx) = mpsc::unbounded_channel();
         let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
         
+        // Create Docker connection pool (adjust size based on your needs)
+        let pool_size = std::thread::available_parallelism()
+            .map(|n| n.get().max(4).min(16))  // Between 4-16 connections
+            .unwrap_or(8);
+        
+        let docker_pool = DockerPool::new(pool_size).await?;
+        
         // Spawn background task for stats collection
         let stats_tx = tx.clone();
+        let pool_clone = docker_pool.clone();
         tokio::spawn(async move {
-            stats_collection_task(stats_tx, bg_rx, shutdown_rx).await;
+            stats_collection_task(stats_tx, bg_rx, shutdown_rx, pool_clone).await;
         });
 
         Ok(App {
@@ -100,6 +186,7 @@ impl App {
             receiver: rx,
             background_sender: bg_tx,
             shutdown_sender: shutdown_tx,
+            docker_pool,
         })
     }
 
@@ -121,17 +208,14 @@ impl App {
 
     fn toggle_auto_refresh(&mut self) {
         self.auto_refresh = !self.auto_refresh;
-        // Send command to background task
         let _ = self.background_sender.send(BackgroundCommand::SetAutoRefresh(self.auto_refresh));
     }
 
     fn force_refresh(&mut self) {
-        // Send force refresh command to background task
         let _ = self.background_sender.send(BackgroundCommand::ForceRefresh);
     }
 
     fn handle_messages(&mut self) {
-        // Process all available messages without blocking
         while let Ok(message) = self.receiver.try_recv() {
             match message {
                 AppMessage::ContainerData(containers) => {
@@ -139,7 +223,6 @@ impl App {
                     self.error_message = None;
                     self.last_update = Instant::now();
                     
-                    // Adjust selected index if containers list changed
                     if self.selected_index >= self.containers.len() && !self.containers.is_empty() {
                         self.selected_index = self.containers.len() - 1;
                     }
@@ -149,7 +232,6 @@ impl App {
                     self.last_update = Instant::now();
                 }
                 AppMessage::Shutdown => {
-                    // Background task is shutting down
                     break;
                 }
             }
@@ -165,14 +247,15 @@ impl App {
 async fn stats_collection_task(
     sender: mpsc::UnboundedSender<AppMessage>,
     mut command_receiver: mpsc::UnboundedReceiver<BackgroundCommand>,
-    mut shutdown_receiver: tokio::sync::oneshot::Receiver<()>
+    mut shutdown_receiver: tokio::sync::oneshot::Receiver<()>,
+    docker_pool: DockerPool
 ) {
     let mut last_refresh: Instant;
     let mut interval = tokio::time::interval(Duration::from_millis(100));
-    let mut auto_refresh = true; // Start with auto-refresh enabled
+    let mut auto_refresh = true;
     
     // Get initial data
-    match get_container_stats().await {
+    match get_container_stats(&docker_pool).await {
         Ok(containers) => {
             let _ = sender.send(AppMessage::ContainerData(containers));
         }
@@ -195,8 +278,7 @@ async fn stats_collection_task(
                         auto_refresh = enabled;
                     }
                     Some(BackgroundCommand::ForceRefresh) => {
-                        // Force immediate refresh regardless of auto_refresh setting
-                        match get_container_stats().await {
+                        match get_container_stats(&docker_pool).await {
                             Ok(containers) => {
                                 if sender.send(AppMessage::ContainerData(containers)).is_err() {
                                     break;
@@ -217,9 +299,8 @@ async fn stats_collection_task(
                 }
             }
             _ = interval.tick() => {
-                // Only refresh automatically if auto_refresh is enabled
                 if auto_refresh && last_refresh.elapsed() >= Duration::from_secs(1) {
-                    match get_container_stats().await {
+                    match get_container_stats(&docker_pool).await {
                         Ok(containers) => {
                             if sender.send(AppMessage::ContainerData(containers)).is_err() {
                                 break;
@@ -282,28 +363,23 @@ async fn run_app<B: Backend>(
 ) -> Result<(), String> {
     
     loop {
-        // Handle messages from background task
         app.handle_messages();
 
-        // Handle user input with immediate navigation response
-        if event::poll(Duration::from_millis(32)).map_err(|e| e.to_string())? { // ~30fps polling
+        if event::poll(Duration::from_millis(32)).map_err(|e| e.to_string())? {
             if let Event::Key(key) = event::read().map_err(|e| e.to_string())? {
                 match key.code {
                     KeyCode::Char('q') | KeyCode::Esc => return Ok(()),
                     KeyCode::Down | KeyCode::Char('j') => {
                         app.next();
-                        // Immediate redraw for navigation - no data refresh needed
                         terminal.draw(|f| ui(f, app)).map_err(|e| e.to_string())?;
                         continue;
                     },
                     KeyCode::Up | KeyCode::Char('k') => {
                         app.previous();
-                        // Immediate redraw for navigation - no data refresh needed
                         terminal.draw(|f| ui(f, app)).map_err(|e| e.to_string())?;
                         continue;
                     },
                     KeyCode::Char('r') => {
-                        // Manual refresh - force refresh regardless of auto-refresh setting
                         app.force_refresh();
                     },
                     KeyCode::Char(' ') => {
@@ -313,11 +389,12 @@ async fn run_app<B: Backend>(
                         if let Some(container) = app.containers.get(app.selected_index) {
                             let container_id = container.id.clone();
                             let container_state = container.state.clone();
+                            let pool = app.docker_pool.clone();
                             tokio::spawn(async move {
                                 if container_state == "running" {
-                                    let _ = stop_container(&container_id).await;
+                                    let _ = stop_container(&container_id, &pool).await;
                                 } else {
-                                    let _ = start_container(&container_id).await;
+                                    let _ = start_container(&container_id, &pool).await;
                                 }
                             });
                         }
@@ -326,8 +403,9 @@ async fn run_app<B: Backend>(
                         if let Some(container) = app.containers.get(app.selected_index) {
                             if container.state != "running" {
                                 let container_id = container.id.clone();
+                                let pool = app.docker_pool.clone();
                                 tokio::spawn(async move {
-                                    let _ = remove_container(&container_id).await;
+                                    let _ = remove_container(&container_id, &pool).await;
                                 });
                             }
                         }
@@ -337,7 +415,6 @@ async fn run_app<B: Backend>(
             }
         }
 
-        // Regular redraw (data updates come from background task)
         terminal.draw(|f| ui(f, app)).map_err(|e| e.to_string())?;
     }
 }
@@ -346,13 +423,12 @@ fn ui(f: &mut Frame, app: &App) {
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Min(10),    // Main table
-            Constraint::Length(6),  // Details panel
-            Constraint::Length(3),  // Status/Help
+            Constraint::Min(10),
+            Constraint::Length(6),
+            Constraint::Length(3),
         ])
         .split(f.size());
 
-    // Main table
     let selected_style = Style::default().add_modifier(Modifier::REVERSED);
     let header_cells = ["ID", "Name", "Status", "CPU %", "Memory (MB)", "Mem %", "Image"]
         .iter()
@@ -396,13 +472,13 @@ fn ui(f: &mut Frame, app: &App) {
     let table = Table::new(
         rows,
         [
-            Constraint::Length(12),     // ID - fixed width
-            Constraint::Fill(3),        // Name - flexible, equal share
-            Constraint::Fill(2),        // Status - flexible, equal share  
-            Constraint::Length(8),      // CPU % - fixed width
-            Constraint::Length(20),     // Memory - fixed width
-            Constraint::Length(8),      // Mem % - fixed width
-            Constraint::Fill(2),        // Image - flexible, equal share
+            Constraint::Length(12),
+            Constraint::Fill(3),
+            Constraint::Fill(2),
+            Constraint::Length(8),
+            Constraint::Length(20),
+            Constraint::Length(8),
+            Constraint::Fill(2),
         ]
     )
         .header(header)
@@ -414,7 +490,6 @@ fn ui(f: &mut Frame, app: &App) {
     state.select(Some(app.selected_index));
     f.render_stateful_widget(table, chunks[0], &mut state);
 
-    // Details panel for selected container
     if let Some(container) = app.containers.get(app.selected_index) {
         let info_text = vec![
             Line::from(vec![Span::styled("Full ID: ", Style::default().fg(Color::Yellow)), Span::raw(&container.id)]),
@@ -427,7 +502,6 @@ fn ui(f: &mut Frame, app: &App) {
         f.render_widget(info_paragraph, chunks[1]);
     }
 
-    // Status/Help bar - use actual last update time from app state
     let last_update_time = chrono::DateTime::<chrono::Utc>::from(
         std::time::SystemTime::now() - app.last_update.elapsed()
     );
@@ -447,7 +521,6 @@ fn ui(f: &mut Frame, app: &App) {
 
     f.render_widget(help, chunks[2]);
 
-    // Show error message if any
     if let Some(error) = &app.error_message {
         let error_popup = Paragraph::new(error.as_str())
             .style(Style::default().fg(Color::Red))
@@ -465,10 +538,9 @@ async fn is_docker_available() -> bool {
     }
 }
 
-async fn get_container_stats() -> Result<Vec<ContainerInfo>, String> {
-    let docker = Docker::connect_with_socket_defaults().map_err(|e| e.to_string())?;
+async fn get_container_stats(docker_pool: &DockerPool) -> Result<Vec<ContainerInfo>, String> {
+    let docker = docker_pool.get_simple_connection();
     
-    // Get all containers (running and stopped)
     let options = Some(ListContainersOptions::<String> {
         all: true,
         ..Default::default()
@@ -489,13 +561,13 @@ async fn get_container_stats() -> Result<Vec<ContainerInfo>, String> {
         })
         .collect();
     
-    // Collect stats for all running containers in parallel
+    // Collect stats for all running containers in parallel using the pool
     let stats_futures: Vec<_> = running_containers.iter()
         .map(|(id, _)| {
-            let docker_clone = docker.clone();
+            let pool_clone = docker_pool.clone();
             let id_clone = id.clone();
             async move {
-                match get_container_resource_stats(&docker_clone, &id_clone).await {
+                match get_container_resource_stats(&pool_clone, &id_clone).await {
                     Ok(stats) => Some((id_clone, stats)),
                     Err(_) => None,
                 }
@@ -503,10 +575,8 @@ async fn get_container_stats() -> Result<Vec<ContainerInfo>, String> {
         })
         .collect();
     
-    // Wait for all stats collection to complete
     let stats_results = futures::future::join_all(stats_futures).await;
     
-    // Build stats map from results
     let mut stats_map = HashMap::new();
     for result in stats_results {
         if let Some((id, stats)) = result {
@@ -514,7 +584,6 @@ async fn get_container_stats() -> Result<Vec<ContainerInfo>, String> {
         }
     }
     
-    // Build container info list (rest of the function remains the same)
     let mut container_infos = Vec::new();
     for container in containers {
         if let Some(ref id) = container.id {
@@ -564,7 +633,6 @@ fn format_ports(container: &ContainerSummary) -> String {
         .map(|ports| {
             ports.iter()
                 .filter_map(|port| {
-                    // private_port is u16, public_port is Option<u16>, typ is Option<PortTypeEnum>
                     let private_port = port.private_port;
                     let public_port = port.public_port;
                     let port_type = &port.typ;
@@ -591,20 +659,21 @@ fn format_ports(container: &ContainerSummary) -> String {
 }
 
 async fn get_container_resource_stats(
-    docker: &Docker, 
+    docker_pool: &DockerPool, 
     container_id: &str
 ) -> Result<(f64, String, f64), String> {
+    let docker_conn = docker_pool.get_connection().await?;
+    
     let options = Some(StatsOptions {
         stream: false,
         one_shot: true,
     });
     
-    let mut stats_stream = docker.stats(container_id, options);
+    let mut stats_stream = docker_conn.stats(container_id, options);
     
     if let Some(stats_result) = stats_stream.next().await {
         let stats = stats_result.map_err(|e| e.to_string())?;
         
-        // Calculate CPU percentage using cached previous values
         let cpu_percent = {
             let current_cpu_total = stats.cpu_stats.cpu_usage.total_usage;
             let current_system_cpu = stats.cpu_stats.system_cpu_usage.unwrap_or(0);
@@ -626,10 +695,9 @@ async fn get_container_resource_stats(
                     0.0
                 }
             } else {
-                0.0 // First measurement, no previous data
+                0.0
             };
             
-            // Update the cache with current values
             previous_stats_map.insert(container_id.to_string(), PreviousStats {
                 cpu_total: current_cpu_total,
                 system_cpu: current_system_cpu,
@@ -639,7 +707,6 @@ async fn get_container_resource_stats(
             cpu_percent
         };
         
-        // Calculate memory usage and percentage - Fixed to handle direct MemoryStats struct
         let (memory_usage_str, memory_percent) = {
             let memory_stats = &stats.memory_stats;
             let usage = memory_stats.usage.unwrap_or(0);
@@ -662,20 +729,20 @@ async fn get_container_resource_stats(
     }
 }
 
-async fn start_container(container_id: &str) -> Result<(), String> {
-    let docker = Docker::connect_with_socket_defaults().map_err(|e| e.to_string())?;
+async fn start_container(container_id: &str, docker_pool: &DockerPool) -> Result<(), String> {
+    let docker = docker_pool.get_simple_connection();
     docker.start_container(container_id, None::<StartContainerOptions<String>>).await.map_err(|e| e.to_string())?;
     Ok(())
 }
 
-async fn stop_container(container_id: &str) -> Result<(), String> {
-    let docker = Docker::connect_with_socket_defaults().map_err(|e| e.to_string())?;
+async fn stop_container(container_id: &str, docker_pool: &DockerPool) -> Result<(), String> {
+    let docker = docker_pool.get_simple_connection();
     docker.stop_container(container_id, None::<StopContainerOptions>).await.map_err(|e| e.to_string())?;
     Ok(())
 }
 
-async fn remove_container(container_id: &str) -> Result<(), String> {
-    let docker = Docker::connect_with_socket_defaults().map_err(|e| e.to_string())?;
+async fn remove_container(container_id: &str, docker_pool: &DockerPool) -> Result<(), String> {
+    let docker = docker_pool.get_simple_connection();
     let options = Some(RemoveContainerOptions {
         force: false,
         v: true,
