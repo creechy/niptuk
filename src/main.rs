@@ -475,22 +475,47 @@ async fn get_container_stats() -> Result<Vec<ContainerInfo>, String> {
     });
     
     let containers = docker.list_containers(options).await.map_err(|e| e.to_string())?;
-    let mut container_infos = Vec::new();
     
-    // Collect stats for running containers
-    let mut stats_map = HashMap::new();
-    for container in &containers {
-        if let Some(id) = &container.id {
-            let state = get_container_state(container);
-            if state == "running" {
-                if let Ok((cpu, mem_usage, mem_percent)) = get_container_resource_stats(&docker, id).await {
-                    stats_map.insert(id.clone(), (cpu, mem_usage, mem_percent));
+    // Collect running container IDs
+    let running_containers: Vec<_> = containers.iter()
+        .filter_map(|container| {
+            container.id.as_ref().and_then(|id| {
+                if get_container_state(container) == "running" {
+                    Some((id.clone(), container))
+                } else {
+                    None
+                }
+            })
+        })
+        .collect();
+    
+    // Collect stats for all running containers in parallel
+    let stats_futures: Vec<_> = running_containers.iter()
+        .map(|(id, _)| {
+            let docker_clone = docker.clone();
+            let id_clone = id.clone();
+            async move {
+                match get_container_resource_stats(&docker_clone, &id_clone).await {
+                    Ok(stats) => Some((id_clone, stats)),
+                    Err(_) => None,
                 }
             }
+        })
+        .collect();
+    
+    // Wait for all stats collection to complete
+    let stats_results = futures::future::join_all(stats_futures).await;
+    
+    // Build stats map from results
+    let mut stats_map = HashMap::new();
+    for result in stats_results {
+        if let Some((id, stats)) = result {
+            stats_map.insert(id, stats);
         }
     }
     
-    // Build container info list
+    // Build container info list (rest of the function remains the same)
+    let mut container_infos = Vec::new();
     for container in containers {
         if let Some(ref id) = container.id {
             let name = extract_container_name(&container);
