@@ -68,6 +68,21 @@ enum BackgroundCommand {
     Shutdown,
 }
 
+// NEW: Shared Docker client struct
+#[derive(Clone)]
+struct SharedDockerClient {
+    docker: Arc<Docker>,
+}
+
+impl SharedDockerClient {
+    async fn new() -> Result<Self, String> {
+        let docker = Docker::connect_with_socket_defaults().map_err(|e| e.to_string())?;
+        Ok(Self {
+            docker: Arc::new(docker),
+        })
+    }
+}
+
 struct App {
     containers: Vec<ContainerInfo>,
     selected_index: usize,
@@ -88,7 +103,7 @@ impl App {
         // Spawn background task for stats collection
         let stats_tx = tx.clone();
         tokio::spawn(async move {
-            stats_collection_task(stats_tx, bg_rx, shutdown_rx).await;
+            stats_collection_task_optimized(stats_tx, bg_rx, shutdown_rx).await;
         });
 
         Ok(App {
@@ -121,17 +136,14 @@ impl App {
 
     fn toggle_auto_refresh(&mut self) {
         self.auto_refresh = !self.auto_refresh;
-        // Send command to background task
         let _ = self.background_sender.send(BackgroundCommand::SetAutoRefresh(self.auto_refresh));
     }
 
     fn force_refresh(&mut self) {
-        // Send force refresh command to background task
         let _ = self.background_sender.send(BackgroundCommand::ForceRefresh);
     }
 
     fn handle_messages(&mut self) {
-        // Process all available messages without blocking
         while let Ok(message) = self.receiver.try_recv() {
             match message {
                 AppMessage::ContainerData(containers) => {
@@ -139,7 +151,6 @@ impl App {
                     self.error_message = None;
                     self.last_update = Instant::now();
                     
-                    // Adjust selected index if containers list changed
                     if self.selected_index >= self.containers.len() && !self.containers.is_empty() {
                         self.selected_index = self.containers.len() - 1;
                     }
@@ -149,7 +160,6 @@ impl App {
                     self.last_update = Instant::now();
                 }
                 AppMessage::Shutdown => {
-                    // Background task is shutting down
                     break;
                 }
             }
@@ -162,17 +172,27 @@ impl App {
     }
 }
 
-async fn stats_collection_task(
+// MODIFIED: Optimized background task with shared Docker client
+async fn stats_collection_task_optimized(
     sender: mpsc::UnboundedSender<AppMessage>,
     mut command_receiver: mpsc::UnboundedReceiver<BackgroundCommand>,
     mut shutdown_receiver: tokio::sync::oneshot::Receiver<()>
 ) {
-    let mut last_refresh: Instant;
+    // Create shared Docker client once
+    let docker_client = match SharedDockerClient::new().await {
+        Ok(client) => client,
+        Err(e) => {
+            let _ = sender.send(AppMessage::Error(format!("Failed to connect to Docker: {}", e)));
+            return;
+        }
+    };
+    
+    let mut last_refresh = Instant::now();
     let mut interval = tokio::time::interval(Duration::from_millis(100));
-    let mut auto_refresh = true; // Start with auto-refresh enabled
+    let mut auto_refresh = true;
     
     // Get initial data
-    match get_container_stats().await {
+    match get_container_stats_optimized(&docker_client).await {
         Ok(containers) => {
             let _ = sender.send(AppMessage::ContainerData(containers));
         }
@@ -180,7 +200,6 @@ async fn stats_collection_task(
             let _ = sender.send(AppMessage::Error(format!("Error: {}", e)));
         }
     }
-
     last_refresh = Instant::now();
     
     loop {
@@ -195,8 +214,7 @@ async fn stats_collection_task(
                         auto_refresh = enabled;
                     }
                     Some(BackgroundCommand::ForceRefresh) => {
-                        // Force immediate refresh regardless of auto_refresh setting
-                        match get_container_stats().await {
+                        match get_container_stats_optimized(&docker_client).await {
                             Ok(containers) => {
                                 if sender.send(AppMessage::ContainerData(containers)).is_err() {
                                     break;
@@ -217,9 +235,8 @@ async fn stats_collection_task(
                 }
             }
             _ = interval.tick() => {
-                // Only refresh automatically if auto_refresh is enabled
                 if auto_refresh && last_refresh.elapsed() >= Duration::from_secs(1) {
-                    match get_container_stats().await {
+                    match get_container_stats_optimized(&docker_client).await {
                         Ok(containers) => {
                             if sender.send(AppMessage::ContainerData(containers)).is_err() {
                                 break;
@@ -236,6 +253,203 @@ async fn stats_collection_task(
             }
         }
     }
+}
+
+// NEW: Optimized stats collection function
+async fn get_container_stats_optimized(docker_client: &SharedDockerClient) -> Result<Vec<ContainerInfo>, String> {
+    let docker = &docker_client.docker;
+    
+    // Get all containers with timeout
+    let containers_future = docker.list_containers(Some(ListContainersOptions::<String> {
+        all: true,
+        ..Default::default()
+    }));
+    
+    let containers = tokio::time::timeout(Duration::from_secs(3), containers_future)
+        .await
+        .map_err(|_| "Container list timeout".to_string())?
+        .map_err(|e| e.to_string())?;
+    
+    // Collect running container IDs for parallel stats collection
+    let running_containers: Vec<_> = containers.iter()
+        .filter_map(|container| {
+            container.id.as_ref().and_then(|id| {
+                if get_container_state(container) == "running" {
+                    Some(id.clone())
+                } else {
+                    None
+                }
+            })
+        })
+        .collect();
+    
+    // Collect stats in parallel with individual timeouts using spawn for true parallelism
+    let stats_futures: Vec<_> = running_containers.iter()
+        .map(|id| {
+            let docker_clone = Arc::clone(docker);
+            let id_clone = id.clone();
+            tokio::spawn(async move {
+                match get_container_resource_stats_optimized(&docker_clone, &id_clone).await {
+                    Ok(stats) => Some((id_clone, stats)),
+                    Err(_) => None,
+                }
+            })
+        })
+        .collect();
+    
+    // Wait for all stats with overall timeout
+    let stats_timeout = tokio::time::timeout(Duration::from_secs(2), futures::future::join_all(stats_futures));
+    let stats_results = match stats_timeout.await {
+        Ok(results) => results,
+        Err(_) => {
+            // Timeout occurred, return containers without stats
+            return build_container_info_list(containers, HashMap::new());
+        }
+    };
+    
+    // Build stats map from successful results
+    let mut stats_map = HashMap::new();
+    for result in stats_results {
+        if let Ok(Some((id, stats))) = result {
+            stats_map.insert(id, stats);
+        }
+    }
+    
+    build_container_info_list(containers, stats_map)
+}
+
+// MODIFIED: Optimized individual stats collection with timeout
+async fn get_container_resource_stats_optimized(
+    docker: &Docker, 
+    container_id: &str
+) -> Result<(f64, String, f64), String> {
+    let options = Some(StatsOptions {
+        stream: false,
+        one_shot: true,
+    });
+    
+    let mut stats_stream = docker.stats(container_id, options);
+    
+    // Individual timeout per container
+    let stats_future = stats_stream.next();
+    let stats = tokio::time::timeout(Duration::from_millis(800), stats_future)
+        .await
+        .map_err(|_| "Individual stats timeout".to_string())?
+        .ok_or("No stats received".to_string())?
+        .map_err(|e| e.to_string())?;
+    
+    // Calculate CPU percentage with single mutex operation
+    let cpu_percent = {
+        let current_cpu_total = stats.cpu_stats.cpu_usage.total_usage;
+        let current_system_cpu = stats.cpu_stats.system_cpu_usage.unwrap_or(0);
+        let current_time = Instant::now();
+        let number_cpus = stats.cpu_stats.online_cpus.unwrap_or_else(|| {
+            stats.cpu_stats.cpu_usage.percpu_usage.as_ref().map(|v| v.len() as u64).unwrap_or(1)
+        }) as f64;
+        
+        // Single mutex lock for read and write
+        let mut previous_stats_map = PREVIOUS_STATS.lock().unwrap();
+        
+        let cpu_percent = if let Some(prev) = previous_stats_map.get(container_id) {
+            let cpu_delta = current_cpu_total.saturating_sub(prev.cpu_total) as f64;
+            let system_delta = current_system_cpu.saturating_sub(prev.system_cpu) as f64;
+            let time_delta = current_time.duration_since(prev.timestamp).as_secs_f64();
+            
+            if system_delta > 0.0 && time_delta > 0.0 {
+                (cpu_delta / system_delta) * number_cpus * 100.0
+            } else {
+                0.0
+            }
+        } else {
+            0.0
+        };
+        
+        // Update immediately while we have the lock
+        previous_stats_map.insert(container_id.to_string(), PreviousStats {
+            cpu_total: current_cpu_total,
+            system_cpu: current_system_cpu,
+            timestamp: current_time,
+        });
+        
+        cpu_percent
+    };
+    
+    // Calculate memory usage and percentage
+    let (memory_usage_str, memory_percent) = {
+        let memory_stats = &stats.memory_stats;
+        let usage = memory_stats.usage.unwrap_or(0);
+        let limit = memory_stats.limit.unwrap_or(1);
+        
+        let usage_mb = usage as f64 / 1024.0 / 1024.0;
+        let limit_mb = limit as f64 / 1024.0 / 1024.0;
+        let percent = if limit > 0 { (usage as f64 / limit as f64) * 100.0 } else { 0.0 };
+        
+        if usage > 0 && limit > 0 {
+            (format!("{:.1} / {:.1}", usage_mb, limit_mb), percent)
+        } else {
+            ("N/A".to_string(), 0.0)
+        }
+    };
+    
+    Ok((cpu_percent, memory_usage_str, memory_percent))
+}
+
+// NEW: Helper function to build container info list
+fn build_container_info_list(
+    containers: Vec<ContainerSummary>, 
+    stats_map: HashMap<String, (f64, String, f64)>
+) -> Result<Vec<ContainerInfo>, String> {
+    let mut container_infos = Vec::new();
+    
+    for container in containers {
+        if let Some(ref id) = container.id {
+            let name = extract_container_name(&container);
+            let status = container.status.clone().unwrap_or_else(|| "Unknown".to_string());
+            let image = container.image.clone().unwrap_or_else(|| "Unknown".to_string());
+            let ports = format_ports(&container);
+            let state = get_container_state(&container);
+            
+            let (cpu_percent, memory_usage, memory_percent) = stats_map
+                .get(id)
+                .cloned()
+                .unwrap_or((0.0, "N/A".to_string(), 0.0));
+
+            container_infos.push(ContainerInfo {
+                id: id.clone(),
+                name,
+                status,
+                cpu_percent,
+                memory_usage,
+                memory_percent,
+                image,
+                ports,
+                state,
+            });
+        }
+    }
+
+    Ok(container_infos)
+}
+
+// MODIFIED: Update container operation functions to use shared client
+async fn start_container_optimized(container_id: &str, docker_client: &SharedDockerClient) -> Result<(), String> {
+    docker_client.docker.start_container(container_id, None::<StartContainerOptions<String>>).await.map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+async fn stop_container_optimized(container_id: &str, docker_client: &SharedDockerClient) -> Result<(), String> {
+    docker_client.docker.stop_container(container_id, None::<StopContainerOptions>).await.map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+async fn remove_container_optimized(container_id: &str, docker_client: &SharedDockerClient) -> Result<(), String> {
+    let options = Some(RemoveContainerOptions {
+        force: false,
+        v: true,
+        link: false,
+    });
+    docker_client.docker.remove_container(container_id, options).await.map_err(|e| e.to_string())?;
+    Ok(())
 }
 
 #[tokio::main]
@@ -286,24 +500,21 @@ async fn run_app<B: Backend>(
         app.handle_messages();
 
         // Handle user input with immediate navigation response
-        if event::poll(Duration::from_millis(32)).map_err(|e| e.to_string())? { // ~30fps polling
+        if event::poll(Duration::from_millis(32)).map_err(|e| e.to_string())? {
             if let Event::Key(key) = event::read().map_err(|e| e.to_string())? {
                 match key.code {
                     KeyCode::Char('q') | KeyCode::Esc => return Ok(()),
                     KeyCode::Down | KeyCode::Char('j') => {
                         app.next();
-                        // Immediate redraw for navigation - no data refresh needed
                         terminal.draw(|f| ui(f, app)).map_err(|e| e.to_string())?;
                         continue;
                     },
                     KeyCode::Up | KeyCode::Char('k') => {
                         app.previous();
-                        // Immediate redraw for navigation - no data refresh needed
                         terminal.draw(|f| ui(f, app)).map_err(|e| e.to_string())?;
                         continue;
                     },
                     KeyCode::Char('r') => {
-                        // Manual refresh - force refresh regardless of auto-refresh setting
                         app.force_refresh();
                     },
                     KeyCode::Char(' ') => {
@@ -314,6 +525,8 @@ async fn run_app<B: Backend>(
                             let container_id = container.id.clone();
                             let container_state = container.state.clone();
                             tokio::spawn(async move {
+                                // Note: For full optimization, you'd want to pass the shared client here too
+                                // For now, keeping the original behavior for simplicity
                                 if container_state == "running" {
                                     let _ = stop_container(&container_id).await;
                                 } else {
@@ -337,22 +550,21 @@ async fn run_app<B: Backend>(
             }
         }
 
-        // Regular redraw (data updates come from background task)
         terminal.draw(|f| ui(f, app)).map_err(|e| e.to_string())?;
     }
 }
 
+// Keep all the existing UI and helper functions unchanged
 fn ui(f: &mut Frame, app: &App) {
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Min(10),    // Main table
-            Constraint::Length(6),  // Details panel
-            Constraint::Length(3),  // Status/Help
+            Constraint::Min(10),
+            Constraint::Length(6),
+            Constraint::Length(3),
         ])
         .split(f.size());
 
-    // Main table
     let selected_style = Style::default().add_modifier(Modifier::REVERSED);
     let header_cells = ["ID", "Name", "Status", "CPU %", "Memory (MB)", "Mem %", "Image"]
         .iter()
@@ -396,13 +608,13 @@ fn ui(f: &mut Frame, app: &App) {
     let table = Table::new(
         rows,
         [
-            Constraint::Length(12),     // ID - fixed width
-            Constraint::Fill(3),        // Name - flexible, equal share
-            Constraint::Fill(2),        // Status - flexible, equal share  
-            Constraint::Length(8),      // CPU % - fixed width
-            Constraint::Length(20),     // Memory - fixed width
-            Constraint::Length(8),      // Mem % - fixed width
-            Constraint::Fill(2),        // Image - flexible, equal share
+            Constraint::Length(12),
+            Constraint::Fill(3),
+            Constraint::Fill(2),
+            Constraint::Length(8),
+            Constraint::Length(20),
+            Constraint::Length(8),
+            Constraint::Fill(2),
         ]
     )
         .header(header)
@@ -414,7 +626,6 @@ fn ui(f: &mut Frame, app: &App) {
     state.select(Some(app.selected_index));
     f.render_stateful_widget(table, chunks[0], &mut state);
 
-    // Details panel for selected container
     if let Some(container) = app.containers.get(app.selected_index) {
         let info_text = vec![
             Line::from(vec![Span::styled("Full ID: ", Style::default().fg(Color::Yellow)), Span::raw(&container.id)]),
@@ -427,7 +638,6 @@ fn ui(f: &mut Frame, app: &App) {
         f.render_widget(info_paragraph, chunks[1]);
     }
 
-    // Status/Help bar - use actual last update time from app state
     let last_update_time = chrono::DateTime::<chrono::Utc>::from(
         std::time::SystemTime::now() - app.last_update.elapsed()
     );
@@ -447,7 +657,6 @@ fn ui(f: &mut Frame, app: &App) {
 
     f.render_widget(help, chunks[2]);
 
-    // Show error message if any
     if let Some(error) = &app.error_message {
         let error_popup = Paragraph::new(error.as_str())
             .style(Style::default().fg(Color::Red))
@@ -465,85 +674,10 @@ async fn is_docker_available() -> bool {
     }
 }
 
+// Keep original functions for backward compatibility (used in container operations)
 async fn get_container_stats() -> Result<Vec<ContainerInfo>, String> {
-    let docker = Docker::connect_with_socket_defaults().map_err(|e| e.to_string())?;
-    
-    // Get all containers (running and stopped)
-    let options = Some(ListContainersOptions::<String> {
-        all: true,
-        ..Default::default()
-    });
-    
-    let containers = docker.list_containers(options).await.map_err(|e| e.to_string())?;
-    
-    // Collect running container IDs
-    let running_containers: Vec<_> = containers.iter()
-        .filter_map(|container| {
-            container.id.as_ref().and_then(|id| {
-                if get_container_state(container) == "running" {
-                    Some((id.clone(), container))
-                } else {
-                    None
-                }
-            })
-        })
-        .collect();
-    
-    // Collect stats for all running containers in parallel
-    let stats_futures: Vec<_> = running_containers.iter()
-        .map(|(id, _)| {
-            let docker_clone = docker.clone();
-            let id_clone = id.clone();
-            async move {
-                match get_container_resource_stats(&docker_clone, &id_clone).await {
-                    Ok(stats) => Some((id_clone, stats)),
-                    Err(_) => None,
-                }
-            }
-        })
-        .collect();
-    
-    // Wait for all stats collection to complete
-    let stats_results = futures::future::join_all(stats_futures).await;
-    
-    // Build stats map from results
-    let mut stats_map = HashMap::new();
-    for result in stats_results {
-        if let Some((id, stats)) = result {
-            stats_map.insert(id, stats);
-        }
-    }
-    
-    // Build container info list (rest of the function remains the same)
-    let mut container_infos = Vec::new();
-    for container in containers {
-        if let Some(ref id) = container.id {
-            let name = extract_container_name(&container);
-            let status = container.status.clone().unwrap_or_else(|| "Unknown".to_string());
-            let image = container.image.clone().unwrap_or_else(|| "Unknown".to_string());
-            let ports = format_ports(&container);
-            let state = get_container_state(&container);
-            
-            let (cpu_percent, memory_usage, memory_percent) = stats_map
-                .get(id)
-                .cloned()
-                .unwrap_or((0.0, "N/A".to_string(), 0.0));
-
-            container_infos.push(ContainerInfo {
-                id: id.clone(),
-                name,
-                status,
-                cpu_percent,
-                memory_usage,
-                memory_percent,
-                image,
-                ports,
-                state,
-            });
-        }
-    }
-
-    Ok(container_infos)
+    let docker_client = SharedDockerClient::new().await?;
+    get_container_stats_optimized(&docker_client).await
 }
 
 fn get_container_state(container: &ContainerSummary) -> String {
@@ -564,7 +698,6 @@ fn format_ports(container: &ContainerSummary) -> String {
         .map(|ports| {
             ports.iter()
                 .filter_map(|port| {
-                    // private_port is u16, public_port is Option<u16>, typ is Option<PortTypeEnum>
                     let private_port = port.private_port;
                     let public_port = port.public_port;
                     let port_type = &port.typ;
@@ -594,72 +727,7 @@ async fn get_container_resource_stats(
     docker: &Docker, 
     container_id: &str
 ) -> Result<(f64, String, f64), String> {
-    let options = Some(StatsOptions {
-        stream: false,
-        one_shot: true,
-    });
-    
-    let mut stats_stream = docker.stats(container_id, options);
-    
-    if let Some(stats_result) = stats_stream.next().await {
-        let stats = stats_result.map_err(|e| e.to_string())?;
-        
-        // Calculate CPU percentage using cached previous values
-        let cpu_percent = {
-            let current_cpu_total = stats.cpu_stats.cpu_usage.total_usage;
-            let current_system_cpu = stats.cpu_stats.system_cpu_usage.unwrap_or(0);
-            let current_time = Instant::now();
-            let number_cpus = stats.cpu_stats.online_cpus.unwrap_or_else(|| {
-                stats.cpu_stats.cpu_usage.percpu_usage.as_ref().map(|v| v.len() as u64).unwrap_or(1)
-            }) as f64;
-            
-            let mut previous_stats_map = PREVIOUS_STATS.lock().unwrap();
-            
-            let cpu_percent = if let Some(prev) = previous_stats_map.get(container_id) {
-                let cpu_delta = current_cpu_total.saturating_sub(prev.cpu_total) as f64;
-                let system_delta = current_system_cpu.saturating_sub(prev.system_cpu) as f64;
-                let time_delta = current_time.duration_since(prev.timestamp).as_secs_f64();
-                
-                if system_delta > 0.0 && time_delta > 0.0 {
-                    (cpu_delta / system_delta) * number_cpus * 100.0
-                } else {
-                    0.0
-                }
-            } else {
-                0.0 // First measurement, no previous data
-            };
-            
-            // Update the cache with current values
-            previous_stats_map.insert(container_id.to_string(), PreviousStats {
-                cpu_total: current_cpu_total,
-                system_cpu: current_system_cpu,
-                timestamp: current_time,
-            });
-            
-            cpu_percent
-        };
-        
-        // Calculate memory usage and percentage - Fixed to handle direct MemoryStats struct
-        let (memory_usage_str, memory_percent) = {
-            let memory_stats = &stats.memory_stats;
-            let usage = memory_stats.usage.unwrap_or(0);
-            let limit = memory_stats.limit.unwrap_or(1);
-            
-            let usage_mb = usage as f64 / 1024.0 / 1024.0;
-            let limit_mb = limit as f64 / 1024.0 / 1024.0;
-            let percent = if limit > 0 { (usage as f64 / limit as f64) * 100.0 } else { 0.0 };
-            
-            if usage > 0 && limit > 0 {
-                (format!("{:.1} / {:.1}", usage_mb, limit_mb), percent)
-            } else {
-                ("N/A".to_string(), 0.0)
-            }
-        };
-        
-        Ok((cpu_percent, memory_usage_str, memory_percent))
-    } else {
-        Ok((0.0, "N/A".to_string(), 0.0))
-    }
+    get_container_resource_stats_optimized(docker, container_id).await
 }
 
 async fn start_container(container_id: &str) -> Result<(), String> {
