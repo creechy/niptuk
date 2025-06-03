@@ -52,6 +52,10 @@ struct ContainerInfo {
     image: String,
     ports: String,
     state: String,
+    // Cached formatted strings to avoid repeated formatting
+    formatted_cpu: String,
+    formatted_memory_percent: String,
+    short_id: String,
 }
 
 #[derive(Debug)]
@@ -215,16 +219,27 @@ impl App {
         let _ = self.background_sender.send(BackgroundCommand::ForceRefresh);
     }
 
-    fn handle_messages(&mut self) {
+    fn handle_messages(&mut self) -> bool {
+        let mut had_messages = false;
+        
         while let Ok(message) = self.receiver.try_recv() {
+            had_messages = true;
             match message {
                 AppMessage::ContainerData(containers) => {
-                    self.containers = containers;
-                    self.error_message = None;
-                    self.last_update = Instant::now();
-                    
-                    if self.selected_index >= self.containers.len() && !self.containers.is_empty() {
-                        self.selected_index = self.containers.len() - 1;
+                    // Only update if data actually changed
+                    if self.containers.len() != containers.len() || 
+                       self.containers.iter().zip(&containers).any(|(a, b)| {
+                           a.id != b.id || a.status != b.status || 
+                           (a.cpu_percent - b.cpu_percent).abs() > 0.1 ||
+                           (a.memory_percent - b.memory_percent).abs() > 0.1
+                       }) {
+                        self.containers = containers;
+                        self.error_message = None;
+                        self.last_update = Instant::now();
+                        
+                        if self.selected_index >= self.containers.len() && !self.containers.is_empty() {
+                            self.selected_index = self.containers.len() - 1;
+                        }
                     }
                 }
                 AppMessage::Error(error) => {
@@ -236,6 +251,8 @@ impl App {
                 }
             }
         }
+        
+        had_messages
     }
 
     fn shutdown(self) {
@@ -251,6 +268,8 @@ async fn stats_collection_task(
     docker_pool: DockerPool
 ) {
     let mut last_refresh: Instant;
+    // Reduced frequency for stats collection - 2 second interval instead of 1 second
+    let stats_interval = Duration::from_secs(2);
     let mut interval = tokio::time::interval(Duration::from_millis(100));
     let mut auto_refresh = true;
     
@@ -299,7 +318,8 @@ async fn stats_collection_task(
                 }
             }
             _ = interval.tick() => {
-                if auto_refresh && last_refresh.elapsed() >= Duration::from_secs(1) {
+                // Use longer interval for auto-refresh
+                if auto_refresh && last_refresh.elapsed() >= stats_interval {
                     match get_container_stats(&docker_pool).await {
                         Ok(containers) => {
                             if sender.send(AppMessage::ContainerData(containers)).is_err() {
@@ -361,23 +381,36 @@ async fn run_app<B: Backend>(
     terminal: &mut Terminal<B>,
     app: &mut App,
 ) -> Result<(), String> {
+    let mut last_draw = Instant::now();
+    let mut needs_redraw = true;
+    let target_fps = 30; // Reduced from ~30 FPS (32ms) to reasonable rate
+    let frame_duration = Duration::from_millis(1000 / target_fps);
     
     loop {
-        app.handle_messages();
+        // Handle messages first - this might change state requiring redraw
+        let had_messages = app.handle_messages();
+        if had_messages {
+            needs_redraw = true;
+        }
 
-        if event::poll(Duration::from_millis(32)).map_err(|e| e.to_string())? {
+        // Only poll for events if we have time budget or need to be responsive
+        let poll_timeout = if needs_redraw && last_draw.elapsed() >= frame_duration {
+            Duration::from_millis(1) // Quick poll if we need to draw
+        } else {
+            Duration::from_millis(50) // Longer poll to reduce CPU when idle
+        };
+
+        if event::poll(poll_timeout).map_err(|e| e.to_string())? {
             if let Event::Key(key) = event::read().map_err(|e| e.to_string())? {
+                needs_redraw = true; // User input requires redraw
+                
                 match key.code {
                     KeyCode::Char('q') | KeyCode::Esc => return Ok(()),
                     KeyCode::Down | KeyCode::Char('j') => {
                         app.next();
-                        terminal.draw(|f| ui(f, app)).map_err(|e| e.to_string())?;
-                        continue;
                     },
                     KeyCode::Up | KeyCode::Char('k') => {
                         app.previous();
-                        terminal.draw(|f| ui(f, app)).map_err(|e| e.to_string())?;
-                        continue;
                     },
                     KeyCode::Char('r') => {
                         app.force_refresh();
@@ -410,12 +443,22 @@ async fn run_app<B: Backend>(
                             }
                         }
                     }
-                    _ => {}
+                    _ => {
+                        needs_redraw = false; // Unknown key, no redraw needed
+                    }
                 }
             }
         }
 
-        terminal.draw(|f| ui(f, app)).map_err(|e| e.to_string())?;
+        // Only redraw if needed and enough time has passed
+        if needs_redraw && last_draw.elapsed() >= frame_duration {
+            terminal.draw(|f| ui(f, app)).map_err(|e| e.to_string())?;
+            last_draw = Instant::now();
+            needs_redraw = false;
+        }
+        
+        // Small sleep to prevent busy waiting
+        tokio::time::sleep(Duration::from_millis(1)).await;
     }
 }
 
@@ -599,16 +642,19 @@ async fn get_container_stats(docker_pool: &DockerPool) -> Result<Vec<ContainerIn
                 .unwrap_or((0.0, "N/A".to_string(), 0.0));
 
             container_infos.push(ContainerInfo {
-                id: id.clone(),
-                name,
-                status,
-                cpu_percent,
-                memory_usage,
-                memory_percent,
-                image,
-                ports,
-                state,
-            });
+		formatted_cpu: format!("{:.1}%", cpu_percent),
+		formatted_memory_percent: format!("{:.1}%", memory_percent),
+		short_id: id.chars().take(12).collect::<String>(),
+		id: id.to_string(),
+		name,
+		status,
+		cpu_percent,
+		memory_usage,
+		memory_percent,
+		image,
+		ports,
+		state,
+	    });
         }
     }
 
