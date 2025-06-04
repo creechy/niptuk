@@ -163,9 +163,11 @@ impl App {
         let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
 
         // Create Docker connection pool (adjust size based on your needs)
-        let pool_size = std::thread::available_parallelism()
+        let _pool_size = std::thread::available_parallelism()
             .map(|n| n.get().max(4).min(16)) // Between 4-16 connections
             .unwrap_or(8);
+
+        let pool_size = 32;
 
         let docker_pool = DockerPool::new(pool_size).await?;
 
