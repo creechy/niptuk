@@ -666,7 +666,10 @@ fn format_ports(container: &ContainerSummary) -> String {
     container
         .ports
         .as_ref()
-        .map(|ports| {
+        .map(|unsorted_ports| {
+            let mut ports: Vec<_> = unsorted_ports.iter().collect();
+            ports.sort_by_key(|port| port.public_port);
+
             ports
                 .iter()
                 .filter_map(|port| {
