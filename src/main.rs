@@ -3,7 +3,7 @@ use bollard::{
         ListContainersOptions, RemoveContainerOptions, StartContainerOptions, StatsOptions,
         StopContainerOptions,
     },
-    models::ContainerSummary,
+    models::{ContainerSummary, PortTypeEnum},
     Docker,
 };
 use crossterm::{
@@ -676,23 +676,14 @@ fn format_ports(container: &ContainerSummary) -> String {
                     let private_port = port.private_port;
                     let public_port = port.public_port;
                     let port_type = &port.typ;
-
-                    if let Some(port_type_enum) = port_type {
-                        Some(format!(
-                            "{}:{}->{}/{}",
-                            public_port.map_or("".to_string(), |p| p.to_string()),
-                            private_port,
-                            private_port,
-                            port_type_enum.to_string()
-                        ))
-                    } else {
-                        Some(format!(
-                            "{}:{}->{}/tcp",
-                            public_port.map_or("".to_string(), |p| p.to_string()),
-                            private_port,
-                            private_port
-                        ))
-                    }
+                    let port_type_val = port_type.map(|p| p).unwrap_or_else(|| PortTypeEnum::TCP);
+                    Some(format!(
+                        "{}:{}->{}/{}",
+                        public_port.map_or("".to_string(), |p| p.to_string()),
+                        private_port,
+                        private_port,
+                        port_type_val.to_string()
+                    ))
                 })
                 .collect::<Vec<_>>()
                 .join(", ")
